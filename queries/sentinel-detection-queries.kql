@@ -1,0 +1,248 @@
+// NOTE: detection drafts for a fictional environment. Not yet run against a Sentinel workspace;
+// validate table names, thresholds and false-positive rate before enabling.
+// =============================================================================
+// QUERIES KQL — Microsoft Sentinel
+// Projeto: Security Monitoring Migration
+// Autor: Yan Aragão | github.com/YanGuilherme01
+// =============================================================================
+// Conjunto de queries organizadas por domínio.
+// Deploy via: Sentinel > Analytics > Create > Scheduled query rule
+// =============================================================================
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IDENTITY — Impossible Travel
+// Detecta logins de países distintos em menos de 30 minutos
+// MITRE: T1078 — Valid Accounts
+// ─────────────────────────────────────────────────────────────────────────────
+let timeWindow = 30m;
+SigninLogs
+| where TimeGenerated > ago(1d)
+| where ResultType == 0
+| where isnotempty(Location)
+| project TimeGenerated, UserPrincipalName, IPAddress, Location,
+          AppDisplayName, DeviceDetail, RiskState, RiskLevelDuringSignIn
+| summarize
+    Locations     = make_set(Location),
+    IPs           = make_set(IPAddress),
+    LoginCount    = count(),
+    FirstLogin    = min(TimeGenerated),
+    LastLogin     = max(TimeGenerated),
+    Apps          = make_set(AppDisplayName),
+    MaxRiskLevel  = max(RiskLevelDuringSignIn)
+    by UserPrincipalName, bin(TimeGenerated, timeWindow)
+| where array_length(Locations) > 1
+| where LoginCount >= 2
+| extend
+    DurationMinutes  = datetime_diff("minute", LastLogin, FirstLogin),
+    RiskRating       = case(MaxRiskLevel == "high", "🔴 High",
+                            MaxRiskLevel == "medium", "🟡 Medium",
+                            "🟢 Low"),
+    RecommendedAction = "Verify with user. If unrecognized: revoke sessions, force MFA re-enrollment."
+| project TimeGenerated, UserPrincipalName, Locations, IPs,
+          LoginCount, DurationMinutes, Apps, RiskRating, RecommendedAction
+| order by LoginCount desc;
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IDENTITY — MFA Bypass / Fatigue Attack
+// Detecta usuário recebendo muitas solicitações MFA em curto período
+// Indicador de MFA Fatigue attack (encher de notificações até o usuário aceitar)
+// MITRE: T1621 — Multi-Factor Authentication Request Generation
+// ─────────────────────────────────────────────────────────────────────────────
+let mfaFatigueThreshold = 10;  // Solicitações MFA em 30 minutos
+SigninLogs
+| where TimeGenerated > ago(1d)
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| where ResultType in (50074, 50076, 500121)  // MFA required / MFA denied
+| summarize
+    MFARequests    = count(),
+    SuccessCount   = countif(ResultType == 0),
+    DeniedCount    = countif(ResultType != 0),
+    SourceIPs      = make_set(IPAddress, 5),
+    FirstRequest   = min(TimeGenerated),
+    LastRequest    = max(TimeGenerated)
+    by UserPrincipalName, bin(TimeGenerated, 30m)
+| where MFARequests >= mfaFatigueThreshold
+| extend
+    AcceptedAfterFatigue = SuccessCount > 0 and DeniedCount >= mfaFatigueThreshold,
+    Severity = iff(AcceptedAfterFatigue, "CRITICAL — Possible MFA bypass accepted", "HIGH — MFA fatigue attempt")
+| project TimeGenerated, UserPrincipalName, MFARequests,
+          DeniedCount, SuccessCount, SourceIPs, Severity
+| order by MFARequests desc;
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IDENTITY — New Global Admin / Privileged Role Assignment
+// Detecta atribuição de roles privilegiados — mudança crítica que deve ser
+// revisada manualmente sempre
+// MITRE: T1098 — Account Manipulation
+// ─────────────────────────────────────────────────────────────────────────────
+AuditLogs
+| where TimeGenerated > ago(1d)
+| where OperationName in (
+    "Add member to role",
+    "Add eligible member to role",
+    "Add owner to application",
+    "Add service principal"
+)
+| where Result == "success"
+| extend
+    TargetUser    = tostring(TargetResources[0].userPrincipalName),
+    TargetRole    = tostring(TargetResources[0].displayName),
+    InitiatedBy   = tostring(InitiatedBy.user.userPrincipalName),
+    InitiatedByIP = tostring(InitiatedBy.user.ipAddress)
+| where TargetRole in (
+    "Global Administrator",
+    "Privileged Role Administrator",
+    "Security Administrator",
+    "Application Administrator",
+    "Cloud Application Administrator",
+    "Hybrid Identity Administrator"
+)
+| project TimeGenerated, OperationName, TargetUser, TargetRole,
+          InitiatedBy, InitiatedByIP
+| extend
+    AlertTitle    = strcat("Privileged Role Assigned: ", TargetRole, " → ", TargetUser),
+    RecommendedAction = "Verify with IAM team if this assignment was planned. If unauthorized: remove role, investigate initiating account."
+| order by TimeGenerated desc;
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENDPOINT — Uso de Ferramentas Administrativas por Conta Não-Habitual
+// Baseline de 30 dias, alerta quando conta usa ferramenta que nunca usou antes
+// MITRE: T1569, T1047, T1053
+// ─────────────────────────────────────────────────────────────────────────────
+let lookback     = 30d;
+let recentWindow = 1d;
+let adminTools   = dynamic([
+    "PsExec.exe", "PsExec64.exe", "wmic.exe", "net.exe", "net1.exe",
+    "reg.exe", "schtasks.exe", "at.exe", "sc.exe", "bcdedit.exe",
+    "vssadmin.exe", "nltest.exe", "dsquery.exe", "dsget.exe"
+]);
+let baseline = DeviceProcessEvents
+| where Timestamp between (ago(lookback) .. ago(recentWindow))
+| where FileName in~ (adminTools)
+| summarize BaselineUsers = make_set(AccountName) by FileName;
+DeviceProcessEvents
+| where Timestamp > ago(recentWindow)
+| where FileName in~ (adminTools)
+| join kind=leftouter baseline on FileName
+| where not(AccountName in (BaselineUsers))
+| where isnotempty(AccountName)
+| project Timestamp, DeviceName, AccountName, FileName,
+          ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessCommandLine
+| extend
+    AlertTitle    = strcat("First-Time Admin Tool Usage: ", AccountName, " → ", FileName),
+    Severity      = case(
+        FileName in~ ("PsExec.exe", "vssadmin.exe", "bcdedit.exe"), "HIGH",
+        FileName in~ ("schtasks.exe", "wmic.exe", "sc.exe"), "MEDIUM",
+        "LOW"
+    )
+| order by Timestamp desc;
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLOUD — SharePoint/OneDrive Mass Download
+// Detecta download em volume anômalo — possível exfiltração de dados
+// MITRE: T1567.002 — Exfiltration Over Web Service: OneDrive/SharePoint
+// ─────────────────────────────────────────────────────────────────────────────
+let downloadThreshold = 100;  // Ajustar com baseline do ambiente
+OfficeActivity
+| where TimeGenerated > ago(1d)
+| where RecordType == "SharePointFileOperation"
+| where Operation in ("FileDownloaded", "FileCopied", "FileSyncDownloadedFull", "FileAccessed")
+| summarize
+    DownloadCount  = count(),
+    UniqueFiles    = dcount(OfficeObjectId),
+    UniqueIPs      = dcount(ClientIP),
+    FileExtensions = make_set(tostring(split(OfficeObjectId, ".")[-1])),
+    FirstActivity  = min(TimeGenerated),
+    LastActivity   = max(TimeGenerated)
+    by UserId, ClientIP, bin(TimeGenerated, 1h)
+| where DownloadCount > downloadThreshold or UniqueFiles > 50
+| extend
+    RiskLevel = case(
+        DownloadCount > 500 or UniqueFiles > 200, "CRITICAL",
+        DownloadCount > 200 or UniqueFiles > 100, "HIGH",
+        "MEDIUM"
+    ),
+    DurationMinutes = datetime_diff("minute", LastActivity, FirstActivity),
+    SensitiveExtensions = set_intersect(FileExtensions,
+        dynamic(["xlsx","docx","pdf","csv","sql","bak","key","pem"]))
+| extend HasSensitiveFiles = array_length(SensitiveExtensions) > 0
+| project TimeGenerated=LastActivity, UserId, ClientIP, RiskLevel,
+          DownloadCount, UniqueFiles, HasSensitiveFiles,
+          SensitiveExtensions, DurationMinutes, FirstActivity
+| order by DownloadCount desc;
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLOUD — Risky Service Principal Activity
+// Detecta service principals com atividade anômala — vetor comum de
+// persistência e movimentação lateral em ambientes Azure
+// MITRE: T1098.001 — Account Manipulation: Additional Cloud Credentials
+// ─────────────────────────────────────────────────────────────────────────────
+AuditLogs
+| where TimeGenerated > ago(7d)
+| where OperationName in (
+    "Add service principal credentials",
+    "Update service principal",
+    "Add OAuth2PermissionGrant",
+    "Add app role assignment to service principal"
+)
+| where Result == "success"
+| extend
+    ServicePrincipal = tostring(TargetResources[0].displayName),
+    ModifiedBy       = tostring(InitiatedBy.user.userPrincipalName),
+    ModifiedByIP     = tostring(InitiatedBy.user.ipAddress),
+    ChangeDetails    = tostring(TargetResources[0].modifiedProperties)
+| summarize
+    ChangeCount  = count(),
+    Operations   = make_set(OperationName),
+    ModifiedBy   = make_set(ModifiedBy),
+    SourceIPs    = make_set(ModifiedByIP),
+    FirstChange  = min(TimeGenerated),
+    LastChange   = max(TimeGenerated)
+    by ServicePrincipal
+| where ChangeCount > 2
+| extend
+    Severity = case(
+        ChangeCount > 5, "HIGH",
+        ChangeCount > 2, "MEDIUM",
+        "LOW"
+    )
+| project ServicePrincipal, ChangeCount, Operations,
+          ModifiedBy, SourceIPs, Severity, FirstChange, LastChange
+| order by ChangeCount desc;
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THREAT HUNTING — Correlação Multi-fonte: Mesma Conta em 3+ Alertas
+// Identifica contas que aparecem em múltiplos alertas distintos — possível
+// indicador de comprometimento com persistência
+// ─────────────────────────────────────────────────────────────────────────────
+let lookback = 7d;
+SecurityAlert
+| where TimeGenerated > ago(lookback)
+| where AlertSeverity in ("High", "Medium")
+| extend Entities = parse_json(Entities)
+| mv-expand Entity = Entities
+| where Entity.Type == "account"
+| extend AccountName = tostring(Entity.Name)
+| where isnotempty(AccountName)
+| summarize
+    AlertCount   = count(),
+    AlertNames   = make_set(AlertName),
+    Products     = make_set(ProductName),
+    FirstAlert   = min(TimeGenerated),
+    LastAlert    = max(TimeGenerated)
+    by AccountName
+| where AlertCount >= 3
+| extend
+    DaysActive   = datetime_diff("day", LastAlert, FirstAlert),
+    Severity     = case(AlertCount >= 8, "CRITICAL", AlertCount >= 5, "HIGH", "MEDIUM")
+| project AccountName, AlertCount, AlertNames, Products,
+          DaysActive, Severity, FirstAlert, LastAlert
+| order by AlertCount desc;
